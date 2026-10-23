@@ -1,0 +1,796 @@
+#!/usr/bin/env python3
+"""Safely remove a kubeconfig context and its now-orphaned dependencies."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import signal
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+
+VERSION = "0.1.0"
+KINDS = {
+    "context": ("contexts", "delete-context"),
+    "cluster": ("clusters", "delete-cluster"),
+    "user": ("users", "delete-user"),
+}
+
+
+class PruneError(RuntimeError):
+    """An expected, user-facing error."""
+
+
+@dataclass
+class Source:
+    path: Path
+    data: dict[str, Any]
+    digest: str
+    mode: int
+    uid: int
+    gid: int
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+@dataclass(frozen=True)
+class Location:
+    path: Path
+    entry: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class Action:
+    kind: str
+    name: str
+    path: Path
+
+
+@dataclass
+class Plan:
+    context: str
+    actions: list[Action]
+    clear_current: list[Path]
+    kept: list[str]
+    warnings: list[str]
+
+    @property
+    def changed_paths(self) -> list[Path]:
+        # On a cross-file crash, clearing current-context is harmless, removing
+        # the context leaves only orphans, and dependency removal comes last.
+        # A path containing both the target context and dependencies is atomic.
+        context_paths = {
+            action.path for action in self.actions if action.kind == "context"
+        }
+        dependency_paths = {
+            action.path for action in self.actions if action.kind != "context"
+        }
+        ordered: list[Path] = []
+
+        def add(path: Path) -> None:
+            if path not in ordered:
+                ordered.append(path)
+
+        for path in sorted(self.clear_current, key=str):
+            if path not in context_paths and path not in dependency_paths:
+                add(path)
+        for path in sorted(context_paths, key=str):
+            add(path)
+        for path in sorted(dependency_paths, key=str):
+            add(path)
+        for path in sorted(self.clear_current, key=str):
+            add(path)
+        return ordered
+
+
+def quote(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def state_tuple(metadata: os.stat_result, digest: str) -> tuple[Any, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_uid,
+        metadata.st_gid,
+        digest,
+    )
+
+
+def source_state(source: Source) -> tuple[Any, ...]:
+    return (
+        source.device,
+        source.inode,
+        source.size,
+        source.mtime_ns,
+        source.ctime_ns,
+        source.mode,
+        source.uid,
+        source.gid,
+        source.digest,
+    )
+
+
+def kubectl_path() -> str:
+    requested = os.environ.get("KUBECTL", "kubectl")
+    resolved = shutil.which(requested)
+    if resolved is None:
+        raise PruneError(
+            f"kubectl executable not found: {requested!r}. Install kubectl or set KUBECTL."
+        )
+    return resolved
+
+
+def run_kubectl(kubectl: str, kubeconfig: Path, arguments: list[str]) -> str:
+    env = os.environ.copy()
+    # The explicit flag must define the whole scope for physical-file operations.
+    env.pop("KUBECONFIG", None)
+    command = [kubectl, "--kubeconfig", str(kubeconfig), "config", *arguments]
+    result = subprocess.run(
+        command,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown kubectl error"
+        raise PruneError(
+            f"kubectl failed for {kubeconfig}: {detail}\n"
+            f"command: {' '.join(command[:4])} ..."
+        )
+    return result.stdout
+
+
+def load_data(kubectl: str, path: Path) -> dict[str, Any]:
+    output = run_kubectl(kubectl, path, ["view", "--output=json"])
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise PruneError(f"kubectl returned invalid JSON for {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise PruneError(f"unexpected kubeconfig structure in {path}")
+    return data
+
+
+def entries(data: dict[str, Any], plural: str, path: Path) -> list[dict[str, Any]]:
+    value = data.get(plural, [])
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise PruneError(f"invalid {plural} list in {path}")
+    return value
+
+
+def validate_names(source: Source) -> None:
+    for plural, _ in KINDS.values():
+        seen: set[str] = set()
+        for entry in entries(source.data, plural, source.path):
+            name = entry.get("name")
+            if not isinstance(name, str):
+                raise PruneError(f"unnamed entry in {plural} in {source.path}")
+            if name in seen:
+                raise PruneError(
+                    f"duplicate {plural[:-1]} name {quote(name)} inside {source.path}"
+                )
+            seen.add(name)
+
+
+def canonical_existing(path_text: str) -> Path:
+    candidate = Path(path_text).expanduser()
+    try:
+        return candidate.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise PruneError(f"kubeconfig file does not exist: {candidate}") from exc
+    except (OSError, RuntimeError) as exc:
+        raise PruneError(f"cannot resolve kubeconfig path {candidate}: {exc}") from exc
+
+
+def resolve_scope(explicit: str | None) -> tuple[list[Path], list[Path], list[str]]:
+    warnings: list[str] = []
+    missing: list[Path] = []
+
+    if explicit is not None:
+        path = canonical_existing(explicit)
+        if not path.is_file():
+            raise PruneError(f"kubeconfig is not a regular file: {path}")
+        return [path], missing, warnings
+
+    kubeconfig_env = os.environ.get("KUBECONFIG")
+    if kubeconfig_env is None:
+        path = canonical_existing(str(Path.home() / ".kube" / "config"))
+        if not path.is_file():
+            raise PruneError(f"kubeconfig is not a regular file: {path}")
+        return [path], missing, warnings
+
+    raw_paths = [part for part in kubeconfig_env.split(os.pathsep) if part]
+    if not raw_paths:
+        raise PruneError("KUBECONFIG is set but contains no paths")
+
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for raw in raw_paths:
+        candidate = Path(raw).expanduser()
+        try:
+            resolved = candidate.resolve(strict=True)
+        except FileNotFoundError:
+            try:
+                unresolved = candidate.resolve(strict=False)
+            except (OSError, RuntimeError) as exc:
+                raise PruneError(
+                    f"cannot resolve KUBECONFIG path {candidate}: {exc}"
+                ) from exc
+            missing.append(unresolved)
+            warnings.append(f"ignoring missing KUBECONFIG file: {unresolved}")
+            continue
+        except (OSError, RuntimeError) as exc:
+            raise PruneError(f"cannot resolve KUBECONFIG path {candidate}: {exc}") from exc
+        if not resolved.is_file():
+            raise PruneError(f"KUBECONFIG entry is not a regular file: {resolved}")
+        if resolved not in seen:
+            seen.add(resolved)
+            paths.append(resolved)
+
+    if not paths:
+        raise PruneError("none of the files in KUBECONFIG exist")
+    return paths, missing, warnings
+
+
+def load_sources(kubectl: str, paths: Iterable[Path]) -> list[Source]:
+    sources: list[Source] = []
+    for path in paths:
+        metadata_before = path.stat()
+        digest_before = sha256(path)
+        data = load_data(kubectl, path)
+        metadata_after = path.stat()
+        digest_after = sha256(path)
+        if state_tuple(metadata_before, digest_before) != state_tuple(
+            metadata_after, digest_after
+        ):
+            raise PruneError(f"kubeconfig changed while it was being read: {path}")
+        source = Source(
+            path=path,
+            data=data,
+            digest=digest_after,
+            mode=stat.S_IMODE(metadata_after.st_mode),
+            uid=metadata_after.st_uid,
+            gid=metadata_after.st_gid,
+            device=metadata_after.st_dev,
+            inode=metadata_after.st_ino,
+            size=metadata_after.st_size,
+            mtime_ns=metadata_after.st_mtime_ns,
+            ctime_ns=metadata_after.st_ctime_ns,
+        )
+        validate_names(source)
+        sources.append(source)
+    return sources
+
+
+def locations(sources: Iterable[Source], kind: str, name: str) -> list[Location]:
+    plural = KINDS[kind][0]
+    found: list[Location] = []
+    for source in sources:
+        for entry in entries(source.data, plural, source.path):
+            if entry.get("name") == name:
+                found.append(Location(source.path, entry))
+    return found
+
+
+def context_refs(
+    sources: Iterable[Source],
+    field: str,
+    name: str,
+    removed: Location,
+) -> list[tuple[Path, str]]:
+    refs: list[tuple[Path, str]] = []
+    for source in sources:
+        for entry in entries(source.data, "contexts", source.path):
+            if source.path == removed.path and entry.get("name") == removed.entry.get("name"):
+                continue
+            context = entry.get("context", {})
+            if isinstance(context, dict) and context.get(field) == name:
+                refs.append((source.path, str(entry.get("name", ""))))
+    return refs
+
+
+def format_refs(refs: list[tuple[Path, str]]) -> str:
+    return ", ".join(f"{quote(name)} @ {path}" for path, name in refs)
+
+
+def build_plan(
+    sources: list[Source], context_name: str, initial_warnings: list[str]
+) -> Plan:
+    target_locations = locations(sources, "context", context_name)
+    if not target_locations:
+        raise PruneError(f"context not found in the selected kubeconfig scope: {quote(context_name)}")
+    if len(target_locations) > 1:
+        origins = "\n".join(f"  - {item.path}" for item in target_locations)
+        raise PruneError(
+            f"context {quote(context_name)} is defined in multiple files:\n{origins}\n"
+            "Select one physical file with --kubeconfig before deleting it."
+        )
+
+    target = target_locations[0]
+    target_body = target.entry.get("context", {})
+    if not isinstance(target_body, dict):
+        raise PruneError(f"invalid context body for {quote(context_name)} in {target.path}")
+
+    actions = [Action("context", context_name, target.path)]
+    kept: list[str] = []
+    warnings = list(initial_warnings)
+
+    dependencies = (
+        ("cluster", "cluster", target_body.get("cluster", "")),
+        ("user", "user", target_body.get("user", "")),
+    )
+    for kind, field, dependency in dependencies:
+        if not isinstance(dependency, str) or not dependency:
+            warnings.append(f"target context has no {kind} reference")
+            continue
+
+        refs = context_refs(sources, field, dependency, target)
+        definitions = locations(sources, kind, dependency)
+        if refs:
+            kept.append(
+                f"{kind} {quote(dependency)} (still used by {format_refs(refs)})"
+            )
+        elif len(definitions) == 1:
+            actions.append(Action(kind, dependency, definitions[0].path))
+        elif not definitions:
+            warnings.append(
+                f"referenced {kind} {quote(dependency)} is already missing from the selected scope"
+            )
+        else:
+            origins = ", ".join(str(item.path) for item in definitions)
+            kept.append(
+                f"{kind} {quote(dependency)} (duplicate definitions are ambiguous: {origins})"
+            )
+
+    clear_current = [
+        source.path
+        for source in sources
+        if source.data.get("current-context", "") == context_name
+    ]
+
+    for source in sources:
+        if source.mode & 0o077:
+            warnings.append(
+                f"{source.path} has mode {source.mode:04o}; kubeconfigs with credentials are usually 0600"
+            )
+
+    return Plan(context_name, actions, clear_current, kept, warnings)
+
+
+def print_plan(plan: Plan) -> None:
+    print(f"Plan for context {quote(plan.context)}:")
+    for action in plan.actions:
+        suffix = " (orphan after context removal)" if action.kind != "context" else ""
+        print(
+            f"  DELETE {action.kind:<7} {quote(action.name)} @ {action.path}{suffix}"
+        )
+    for path in plan.clear_current:
+        print(f"  CLEAR  current-context @ {path}")
+    for item in plan.kept:
+        print(f"  KEEP   {item}")
+    for warning in plan.warnings:
+        print(f"  WARN   {warning}")
+
+
+def verify_unchanged(sources: Iterable[Source], missing: Iterable[Path]) -> None:
+    for source in sources:
+        if not source.path.exists():
+            raise PruneError(f"kubeconfig disappeared after planning: {source.path}")
+        metadata_before = source.path.stat()
+        digest = sha256(source.path)
+        metadata_after = source.path.stat()
+        expected = source_state(source)
+        if (
+            state_tuple(metadata_before, digest) != expected
+            or state_tuple(metadata_after, digest) != expected
+        ):
+            raise PruneError(
+                f"kubeconfig changed after planning; no changes were applied: {source.path}"
+            )
+    for path in missing:
+        if path.exists():
+            raise PruneError(
+                f"a previously missing KUBECONFIG file appeared after planning: {path}"
+            )
+
+
+def nearest_existing_directory(path: Path) -> Path:
+    candidate = path if path.is_dir() else path.parent
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    if not candidate.is_dir():
+        raise PruneError(f"cannot find an existing directory to lock for {path}")
+    return candidate
+
+
+@contextmanager
+def lock_scope(paths: Iterable[Path]) -> Iterable[None]:
+    """Serialize cooperating prune processes across stable directory inodes."""
+    directories = sorted({nearest_existing_directory(path) for path in paths}, key=str)
+    descriptors: list[tuple[Path, int]] = []
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
+    try:
+        for directory in directories:
+            descriptor = os.open(directory, flags)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                os.close(descriptor)
+                raise PruneError(
+                    f"another ctxrm operation is active in {directory}; retry later"
+                ) from exc
+            descriptors.append((directory, descriptor))
+        yield
+    finally:
+        for _directory, descriptor in reversed(descriptors):
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
+def preserve_ownership(path: Path, source: Source) -> None:
+    try:
+        os.chown(path, source.uid, source.gid)
+    except (AttributeError, PermissionError):
+        pass
+    metadata = path.stat()
+    if (metadata.st_uid, metadata.st_gid) != (source.uid, source.gid):
+        raise PruneError(
+            f"cannot preserve ownership for {source.path}: expected "
+            f"{source.uid}:{source.gid}, got {metadata.st_uid}:{metadata.st_gid}"
+        )
+
+
+def stage_files(sources: list[Source], changed_paths: list[Path]) -> dict[Path, Path]:
+    by_path = {source.path: source for source in sources}
+    staged: dict[Path, Path] = {}
+    try:
+        for path in changed_paths:
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=f".{path.name}.ctxrm.", dir=path.parent
+            )
+            os.close(descriptor)
+            temporary_path = Path(temporary)
+            staged[path] = temporary_path
+            shutil.copy2(path, temporary_path)
+            source = by_path[path]
+            preserve_ownership(temporary_path, source)
+        return staged
+    except BaseException:
+        for path in staged.values():
+            path.unlink(missing_ok=True)
+        raise
+
+
+def apply_to_staged(
+    kubectl: str,
+    sources: list[Source],
+    plan: Plan,
+    staged: dict[Path, Path],
+) -> None:
+    for action in plan.actions:
+        command = KINDS[action.kind][1]
+        # `--` keeps names beginning with a dash from being parsed as flags.
+        run_kubectl(kubectl, staged[action.path], [command, "--", action.name])
+
+    for original in plan.clear_current:
+        temporary = staged[original]
+        if load_data(kubectl, temporary).get("current-context", "") == plan.context:
+            run_kubectl(kubectl, temporary, ["unset", "current-context"])
+
+    staged_sources: list[Source] = []
+    for source in sources:
+        effective_path = staged.get(source.path, source.path)
+        staged_sources.append(
+            Source(
+                path=source.path,
+                data=load_data(kubectl, effective_path),
+                digest="",
+                mode=source.mode,
+                uid=source.uid,
+                gid=source.gid,
+                device=source.device,
+                inode=source.inode,
+                size=source.size,
+                mtime_ns=source.mtime_ns,
+                ctime_ns=source.ctime_ns,
+            )
+        )
+
+    if locations(staged_sources, "context", plan.context):
+        raise PruneError("staging verification failed: target context still exists")
+    for action in plan.actions:
+        if action.kind == "context":
+            continue
+        source = next(item for item in staged_sources if item.path == action.path)
+        if locations([source], action.kind, action.name):
+            raise PruneError(
+                f"staging verification failed: {action.kind} {quote(action.name)} still exists"
+            )
+    for path in plan.clear_current:
+        source = next(item for item in staged_sources if item.path == path)
+        if source.data.get("current-context", "") == plan.context:
+            raise PruneError("staging verification failed: current-context was not cleared")
+
+
+def fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def fsync_file(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def create_persistent_backup(original: Path, timestamp: str, source: Source) -> Path:
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{original.name}.backup.", dir=original.parent
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary)
+    try:
+        # mkstemp starts at 0600. copy2 applies the original mode only after the
+        # complete content has been copied.
+        shutil.copy2(original, temporary_path)
+        preserve_ownership(temporary_path, source)
+        fsync_file(temporary_path)
+
+        base_name = f"{original.name}.bak.{timestamp}"
+        suffix = 0
+        while True:
+            name = base_name if suffix == 0 else f"{base_name}.{suffix}"
+            candidate = original.with_name(name)
+            try:
+                # link is an atomic, no-overwrite publish. Existing files and
+                # dangling symlinks both raise FileExistsError.
+                os.link(temporary_path, candidate, follow_symlinks=False)
+                break
+            except FileExistsError:
+                suffix += 1
+        fsync_directory(original.parent)
+        return candidate
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def copy_for_restore(source: Path, destination: Path, metadata: Source) -> None:
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{destination.name}.restore.", dir=destination.parent
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary)
+    try:
+        shutil.copy2(source, temporary_path)
+        preserve_ownership(temporary_path, metadata)
+        fsync_file(temporary_path)
+        os.replace(temporary_path, destination)
+        fsync_directory(destination.parent)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def commit(
+    sources: list[Source],
+    staged: dict[Path, Path],
+    keep_backups: bool,
+    missing: list[Path],
+) -> dict[Path, Path]:
+    by_path = {source.path: source for source in sources}
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    restore_copies: dict[Path, Path] = {}
+    persistent_backups: dict[Path, Path] = {}
+    committed: list[Path] = []
+
+    try:
+        for original in staged:
+            if keep_backups:
+                backup = create_persistent_backup(original, timestamp, by_path[original])
+                restore_copies[original] = backup
+                persistent_backups[original] = backup
+            else:
+                descriptor, temporary = tempfile.mkstemp(
+                    prefix=f".{original.name}.rollback.", dir=original.parent
+                )
+                os.close(descriptor)
+                rollback = Path(temporary)
+                restore_copies[original] = rollback
+                shutil.copy2(original, rollback)
+                preserve_ownership(rollback, by_path[original])
+                fsync_file(rollback)
+
+        # Narrow the last race window after potentially slow backup I/O.
+        verify_unchanged(sources, missing)
+
+        for original in staged:
+            temporary = staged[original]
+            source = by_path[original]
+            os.chmod(temporary, source.mode)
+            preserve_ownership(temporary, source)
+            fsync_file(temporary)
+            blocked = {signal.SIGINT, signal.SIGTERM}
+            if hasattr(signal, "pthread_sigmask"):
+                previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+                try:
+                    os.replace(temporary, original)
+                    committed.append(original)
+                finally:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            else:  # pragma: no cover - non-POSIX fallback
+                os.replace(temporary, original)
+                committed.append(original)
+            fsync_directory(original.parent)
+
+        return persistent_backups
+    except BaseException as exc:
+        rollback_errors: list[str] = []
+        for original in reversed(committed):
+            try:
+                copy_for_restore(restore_copies[original], original, by_path[original])
+            except BaseException as rollback_exc:  # pragma: no cover - catastrophic path
+                rollback_errors.append(f"{original}: {rollback_exc}")
+        if not committed:
+            for backup in persistent_backups.values():
+                backup.unlink(missing_ok=True)
+        if rollback_errors:
+            raise PruneError(
+                f"commit failed ({exc}); rollback also failed: {'; '.join(rollback_errors)}"
+            ) from exc
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        if committed:
+            raise PruneError(f"commit failed; original files were restored: {exc}") from exc
+        raise PruneError(
+            f"commit aborted before any original file was replaced: {exc}"
+        ) from exc
+    finally:
+        for temporary in staged.values():
+            temporary.unlink(missing_ok=True)
+        if not keep_backups:
+            for rollback in restore_copies.values():
+                rollback.unlink(missing_ok=True)
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        prog="kubectl ctxrm",
+        description=(
+            "Delete one context, then delete its cluster and user only when no other "
+            "context in the selected kubeconfig scope references them."
+        ),
+    )
+    result.add_argument("context", nargs="?", help="exact context name to remove")
+    result.add_argument(
+        "--kubeconfig",
+        metavar="FILE",
+        help="use one physical kubeconfig instead of KUBECONFIG/default config",
+    )
+    result.add_argument(
+        "--dry-run", action="store_true", help="show the plan without changing files"
+    )
+    result.add_argument(
+        "-y", "--yes", action="store_true", help="apply without an interactive prompt"
+    )
+    result.add_argument(
+        "--no-backup",
+        action="store_true",
+        help="do not retain timestamped backups after a successful change",
+    )
+    result.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    return result
+
+
+def execute(arguments: argparse.Namespace) -> int:
+    if not arguments.context:
+        raise PruneError("a context name is required (use --help for usage)")
+
+    if "\x00" in arguments.context:
+        raise PruneError("context name contains a NUL byte")
+
+    kubectl = kubectl_path()
+    paths, missing, scope_warnings = resolve_scope(arguments.kubeconfig)
+    sources = load_sources(kubectl, paths)
+    plan = build_plan(sources, arguments.context, scope_warnings)
+    print_plan(plan)
+
+    if arguments.dry_run:
+        print("Dry run: no files changed and no backups created.")
+        return 0
+
+    if not arguments.yes:
+        if not sys.stdin.isatty():
+            raise PruneError("interactive confirmation unavailable; rerun with --yes")
+        answer = input("Apply this plan? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            print("Cancelled: no files changed.")
+            return 0
+
+    with lock_scope([*paths, *missing]):
+        verify_unchanged(sources, missing)
+        staged = stage_files(sources, plan.changed_paths)
+        try:
+            apply_to_staged(kubectl, sources, plan, staged)
+            verify_unchanged(sources, missing)
+        except BaseException:
+            for temporary in staged.values():
+                temporary.unlink(missing_ok=True)
+            raise
+
+        backups = commit(
+            sources,
+            staged,
+            keep_backups=not arguments.no_backup,
+            missing=missing,
+        )
+    print(f"Removed context {quote(plan.context)} successfully.")
+    if backups:
+        print("Backups:")
+        for original, backup in sorted(backups.items(), key=lambda item: str(item[0])):
+            print(f"  {original} -> {backup}")
+    else:
+        print("No persistent backups retained (--no-backup).")
+    return 0
+
+
+def main() -> int:
+    def terminate_as_interrupt(_signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, terminate_as_interrupt)
+    try:
+        return execute(parser().parse_args())
+    except PruneError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"error: filesystem operation failed: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

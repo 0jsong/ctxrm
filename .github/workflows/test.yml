@@ -1,0 +1,51 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install kubectl
+        shell: bash
+        env:
+          CTXRM_KUBECTL_VERSION: v1.35.0
+        run: |
+          ctxrm_tools_dir="$RUNNER_TEMP/ctxrm-tools"
+          mkdir -p "$ctxrm_tools_dir"
+          ctxrm_url="https://dl.k8s.io/release/$CTXRM_KUBECTL_VERSION/bin/linux/amd64/kubectl"
+          curl --fail --silent --show-error --location --retry 3 "$ctxrm_url" -o "$ctxrm_tools_dir/kubectl"
+          curl --fail --silent --show-error --location --retry 3 "$ctxrm_url.sha256" -o "$ctxrm_tools_dir/kubectl.sha256"
+          cd "$ctxrm_tools_dir"
+          printf '%s  kubectl\n' "$(cat kubectl.sha256)" | sha256sum --check
+          chmod 0755 kubectl
+          printf '%s\n' "$ctxrm_tools_dir" >> "$GITHUB_PATH"
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Verify installed plugin
+        shell: bash
+        run: |
+          make install PREFIX="$RUNNER_TEMP/ctxrm-install"
+          export PATH="$RUNNER_TEMP/ctxrm-install/bin:$PATH"
+          kubectl ctxrm --version
+          kubectl ctxrm --help
